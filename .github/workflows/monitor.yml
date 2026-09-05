@@ -1,0 +1,36 @@
+name: Funbox Monitor
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+
+jobs:
+  check-funbox:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 下載專案檔案
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝套件
+        run: pip install requests beautifulsoup4
+
+      - name: 執行監控程式
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python monitor.py
+
+      - name: 保存已檢查品項記錄
+        run: |
+          git config --global user.name 'github-actions'
+          git config --global user.email 'actions@github.com'
+          git add known_products.json || true
+          git commit -m "Update products cache" || exit 0
+          git push
