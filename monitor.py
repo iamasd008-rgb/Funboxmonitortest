@@ -1,12 +1,12 @@
 import json
 import os
-import re
 import requests
-from bs4 import BeautifulSoup
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 CACHE_FILE = "known_products.json"
-TARGET_URL = "https://shop.funbox.com.tw/categories/takaratomy/beyblade"
+
+# Cyberbiz 分類資料的標準 JSON 端點
+TARGET_JSON_URL = "https://shop.funbox.com.tw/categories/takaratomy/beyblade.json"
 
 HEADERS = {
     "User-Agent": (
@@ -14,8 +14,9 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "X-Requested-With": "XMLHttpRequest",
+    "Referer": "https://shop.funbox.com.tw/categories/takaratomy/beyblade",
 }
 
 
@@ -34,7 +35,7 @@ def send_discord(title, link, price, notice_type="新品上架"):
             {"name": "狀態", "value": "🔥 現貨可購買！", "inline": True},
             {"name": "售價", "value": price or "請見頁面", "inline": True},
         ],
-        "footer": {"text": "Funbox 戰鬥陀螺雷達"},
+        "footer": {"text": "Funbox 戰鬥陀螺雷達 (Cyberbiz)"},
     }
 
     payload = {
@@ -72,63 +73,43 @@ def save_known_products(products_dict):
 
 
 def check_funbox(known_products, current_round):
-    print(f"正在請求目標分類: {TARGET_URL}")
+    print("正在請求 Cyberbiz 分類 JSON 數據...")
     try:
-        resp = requests.get(TARGET_URL, headers=HEADERS, timeout=15)
+        resp = requests.get(TARGET_JSON_URL, headers=HEADERS, timeout=15)
+        print(f"回應狀態碼: {resp.status_code}")
         resp.raise_for_status()
-        html = resp.text
+        data = resp.json()
     except Exception as e:
-        print(f"網頁請求失敗: {e}")
+        print(f"讀取分類 JSON 失敗: {e}")
         return
 
-    soup = BeautifulSoup(html, "html.parser")
-    found_items = []
+    # Cyberbiz 的商品清單通常存放在 products 陣列中
+    products = data.get("products", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+    print(f"取得商品總數: {len(products)}")
 
-    # 1. 檢查是否有 Next.js 的 __NEXT_DATA__
-    next_data = soup.find("script", id="__NEXT_DATA__")
-    if next_data and next_data.string:
-        try:
-            data = json.loads(next_data.string)
-            print("成功找到 __NEXT_DATA__，正在解析商品...")
-            # 遍歷尋找商品清單
-            # 通常在 props -> pageProps 內
-            page_props = data.get("props", {}).get("pageProps", {})
-            products = page_props.get("products") or page_props.get("category", {}).get("products", [])
-            for p in products:
-                title = p.get("title") or p.get("name")
-                handle = p.get("handle") or p.get("_id") or p.get("id")
-                price = p.get("price")
-                link = f"https://shop.funbox.com.tw/products/{handle}"
-                found_items.append((title, link, str(price)))
-        except Exception as err:
-            print(f"解析 __NEXT_DATA__ 失敗: {err}")
+    for item in products:
+        title = item.get("title") or item.get("name", "未命名商品")
+        handle = item.get("handle") or str(item.get("id", ""))
+        link = f"https://shop.funbox.com.tw/products/{handle}" if handle else "https://shop.funbox.com.tw"
 
-    # 2. 正則比對網頁原始碼中所有 /products/ 連結
-    if not found_items:
-        print("未在 Next.js 中解析到商品，執行全頁正則掃描...")
-        # 尋找所有形如 /products/xxxx 的路徑
-        links = set(re.findall(r'href=["\'](/products/[^"\'\?#]+)["\']', html))
-        print(f"全頁抓到的 /products/ 路徑數: {len(links)}")
-        for l in links:
-            found_items.append(("戰鬥陀螺商品", f"https://shop.funbox.com.tw{l}", "詳見官網"))
+        # 庫存判斷：available 或 variants 內的 available 旗標
+        has_stock = item.get("available", True)
+        if "variants" in item and item["variants"]:
+            has_stock = any(v.get("available", False) for v in item["variants"])
 
-    # 3. 處理比對與通知
-    print(f"本次掃描到有效項目數: {len(found_items)}")
-    for title, link, price in found_items:
-        current_round[link] = True
-        print(f"處理項目: {title} -> {link}")
+        # 售價提取
+        price_val = item.get("price") or item.get("price_min")
+        price = f"NT$ {price_val}" if price_val else ""
+
+        print(f"成功解析: {title} | 現貨: {has_stock} | 連結: {link}")
+        current_round[link] = has_stock
 
         if link not in known_products:
-            send_discord(title, link, price, notice_type="新品上架")
+            if has_stock:
+                send_discord(title, link, price, notice_type="新品上架")
         else:
-            if not known_products.get(link, False):
+            if not known_products.get(link, False) and has_stock:
                 send_discord(title, link, price, notice_type="現貨補貨")
-
-    # 4. 若依然為 0，印出頁面中的 script 標籤概況供診斷
-    if not found_items:
-        scripts = [s.get("id") or s.get("src") or "inline" for s in soup.find_all("script")]
-        print("未抓到資料，頁面包含的 Scripts 標籤概況（前 10 個）:")
-        print(scripts[:10])
 
 
 def main():
@@ -139,7 +120,7 @@ def main():
 
     known_products.update(current_round)
     save_known_products(known_products)
-    print("檢查流程結束。")
+    print("檢查完成。")
 
 
 if __name__ == "__main__":
