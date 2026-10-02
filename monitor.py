@@ -4,12 +4,9 @@ import re
 import requests
 from bs4 import BeautifulSoup
 
-# --- 基本設定區 ---
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 CACHE_FILE = "known_products.json"
-
-# 使用搜尋頁面路徑，Shopline 搜尋頁會把商品直接打包在 HTML 的 JS 資料中
-SEARCH_URL = "https://shop.funbox.com.tw/products?query=戰鬥陀螺"
+TARGET_URL = "https://shop.funbox.com.tw/categories/takaratomy/beyblade"
 
 HEADERS = {
     "User-Agent": (
@@ -75,50 +72,63 @@ def save_known_products(products_dict):
 
 
 def check_funbox(known_products, current_round):
-    print("正在請求 Funbox 官網搜尋資料...")
+    print(f"正在請求目標分類: {TARGET_URL}")
     try:
-        resp = requests.get(SEARCH_URL, headers=HEADERS, timeout=15)
+        resp = requests.get(TARGET_URL, headers=HEADERS, timeout=15)
         resp.raise_for_status()
-        html_text = resp.text
+        html = resp.text
     except Exception as e:
         print(f"網頁請求失敗: {e}")
         return
 
-    # 1. 先用正規表達式直接從整個 HTML 原始碼中尋找所有商品 ID 與 Handle
-    # Shopline 典型路徑：/products/64xxxxxx 或 /products/beyblade-xxx
-    product_matches = re.findall(r'href=["\'](/products/[a-zA-Z0-9\-_]+)["\']', html_text)
-    product_handles = set(product_matches)
+    soup = BeautifulSoup(html, "html.parser")
+    found_items = []
 
-    print(f"HTML 正則匹配到的商品網址數: {len(product_handles)}")
+    # 1. 檢查是否有 Next.js 的 __NEXT_DATA__
+    next_data = soup.find("script", id="__NEXT_DATA__")
+    if next_data and next_data.string:
+        try:
+            data = json.loads(next_data.string)
+            print("成功找到 __NEXT_DATA__，正在解析商品...")
+            # 遍歷尋找商品清單
+            # 通常在 props -> pageProps 內
+            page_props = data.get("props", {}).get("pageProps", {})
+            products = page_props.get("products") or page_props.get("category", {}).get("products", [])
+            for p in products:
+                title = p.get("title") or p.get("name")
+                handle = p.get("handle") or p.get("_id") or p.get("id")
+                price = p.get("price")
+                link = f"https://shop.funbox.com.tw/products/{handle}"
+                found_items.append((title, link, str(price)))
+        except Exception as err:
+            print(f"解析 __NEXT_DATA__ 失敗: {err}")
 
-    # 2. 如果頁面採用 JSON 注入（例如 window.__INITIAL_STATE__）
-    json_products = []
-    scripts = re.findall(r'<script[^>]*>(.*?)</script>', html_text, re.DOTALL)
-    for sc in scripts:
-        if "products" in sc and ("price" in sc or "title" in sc):
-            # 尋找 JSON 物件字串
-            objs = re.findall(r'(\{"_id":.*?"title":.*?\})', sc)
-            if objs:
-                json_products.extend(objs)
+    # 2. 正則比對網頁原始碼中所有 /products/ 連結
+    if not found_items:
+        print("未在 Next.js 中解析到商品，執行全頁正則掃描...")
+        # 尋找所有形如 /products/xxxx 的路徑
+        links = set(re.findall(r'href=["\'](/products/[^"\'\?#]+)["\']', html))
+        print(f"全頁抓到的 /products/ 路徑數: {len(links)}")
+        for l in links:
+            found_items.append(("戰鬥陀螺商品", f"https://shop.funbox.com.tw{l}", "詳見官網"))
 
-    print(f"內嵌 Script 提取到的商品數量: {len(json_products)}")
-
-    # 3. 逐一處理抓到的商品網址
-    for handle_path in product_handles:
-        link = f"https://shop.funbox.com.tw{handle_path}"
+    # 3. 處理比對與通知
+    print(f"本次掃描到有效項目數: {len(found_items)}")
+    for title, link, price in found_items:
         current_round[link] = True
+        print(f"處理項目: {title} -> {link}")
 
         if link not in known_products:
-            # 取得商品標題簡述
-            send_discord("戰鬥陀螺新品", link, "請進頁面查看", notice_type="新品上架")
+            send_discord(title, link, price, notice_type="新品上架")
         else:
             if not known_products.get(link, False):
-                send_discord("戰鬥陀螺補貨", link, "請進頁面查看", notice_type="現貨補貨")
+                send_discord(title, link, price, notice_type="現貨補貨")
 
-    # 4. 如果正則與 Script 均未抓到，印出除錯標籤
-    if not product_handles and not json_products:
-        print("未抓到任何商品元素，嘗試印出網頁前 500 字元供排查：")
-        print(html_text[:500])
+    # 4. 若依然為 0，印出頁面中的 script 標籤概況供診斷
+    if not found_items:
+        scripts = [s.get("id") or s.get("src") or "inline" for s in soup.find_all("script")]
+        print("未抓到資料，頁面包含的 Scripts 標籤概況（前 10 個）:")
+        print(scripts[:10])
 
 
 def main():
@@ -129,7 +139,7 @@ def main():
 
     known_products.update(current_round)
     save_known_products(known_products)
-    print("檢查結束。")
+    print("檢查流程結束。")
 
 
 if __name__ == "__main__":
