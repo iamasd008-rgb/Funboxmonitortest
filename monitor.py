@@ -8,17 +8,17 @@ from bs4 import BeautifulSoup
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 CACHE_FILE = "known_products.json"
 
-# 帶上依上架時間倒序排序的完整網址，促使伺服器直接輸出列表 HTML
-TARGET_URL = "https://shop.funbox.com.tw/categories/takaratomy/beyblade?sort_by=created_at&order=desc"
+# 使用搜尋頁面路徑，Shopline 搜尋頁會把商品直接打包在 HTML 的 JS 資料中
+SEARCH_URL = "https://shop.funbox.com.tw/products?query=戰鬥陀螺"
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-TW,zh-Hant;q=0.9",
-    "Referer": "https://shop.funbox.com.tw/",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8",
 }
 
 
@@ -75,71 +75,50 @@ def save_known_products(products_dict):
 
 
 def check_funbox(known_products, current_round):
-    print("正在請求 Funbox 官網陀螺專區...")
+    print("正在請求 Funbox 官網搜尋資料...")
     try:
-        resp = requests.get(TARGET_URL, headers=HEADERS, timeout=15)
+        resp = requests.get(SEARCH_URL, headers=HEADERS, timeout=15)
         resp.raise_for_status()
-        html = resp.text
+        html_text = resp.text
     except Exception as e:
         print(f"網頁請求失敗: {e}")
         return
 
-    soup = BeautifulSoup(html, "html.parser")
+    # 1. 先用正規表達式直接從整個 HTML 原始碼中尋找所有商品 ID 與 Handle
+    # Shopline 典型路徑：/products/64xxxxxx 或 /products/beyblade-xxx
+    product_matches = re.findall(r'href=["\'](/products/[a-zA-Z0-9\-_]+)["\']', html_text)
+    product_handles = set(product_matches)
 
-    # 抓取包含 products 的所有連結，並過濾掉導航列或無效連結
-    all_links = soup.find_all("a", href=True)
-    product_cards = []
-    
-    for a in all_links:
-        href = a["href"]
-        if "/products/" in href and not href.endswith("/products/"):
-            product_cards.append(a)
+    print(f"HTML 正則匹配到的商品網址數: {len(product_handles)}")
 
-    print(f"頁面初步匹配到商品連結數量: {len(product_cards)}")
+    # 2. 如果頁面採用 JSON 注入（例如 window.__INITIAL_STATE__）
+    json_products = []
+    scripts = re.findall(r'<script[^>]*>(.*?)</script>', html_text, re.DOTALL)
+    for sc in scripts:
+        if "products" in sc and ("price" in sc or "title" in sc):
+            # 尋找 JSON 物件字串
+            objs = re.findall(r'(\{"_id":.*?"title":.*?\})', sc)
+            if objs:
+                json_products.extend(objs)
 
-    found_count = 0
-    for link_elem in product_cards:
-        raw_link = link_elem["href"]
-        link = raw_link if raw_link.startswith("http") else f"https://shop.funbox.com.tw{raw_link}"
-        link = link.split("?")[0]
+    print(f"內嵌 Script 提取到的商品數量: {len(json_products)}")
 
-        # 向上找到卡片區塊
-        parent_box = link_elem.find_parent("li") or link_elem.find_parent("div") or link_elem
-        box_text = parent_box.get_text(separator=" ", strip=True)
-
-        # 尋找名稱與價格
-        title = link_elem.get_text(strip=True)
-        if not title:
-            img = link_elem.find("img")
-            if img and img.get("alt"):
-                title = img.get("alt").strip()
-            elif parent_box:
-                title = parent_box.get_text(strip=True)[:40]
-
-        if not title or len(title) < 3 or "加入購物車" == title:
-            continue
-
-        price_match = re.search(r"NT\$\s*[\d,]+", box_text)
-        price = price_match.group(0) if price_match else ""
-
-        is_sold_out = any(k in box_text for k in ["售完", "補貨中", "缺貨", "售罄", "Sold Out"])
-        has_stock = not is_sold_out
-
-        if link in current_round:
-            continue
-
-        found_count += 1
-        current_round[link] = has_stock
-        print(f"成功捕捉到商品: {title} | 售價: {price} | 現貨: {has_stock}")
+    # 3. 逐一處理抓到的商品網址
+    for handle_path in product_handles:
+        link = f"https://shop.funbox.com.tw{handle_path}"
+        current_round[link] = True
 
         if link not in known_products:
-            if has_stock:
-                send_discord(title, link, price, notice_type="新品上架")
+            # 取得商品標題簡述
+            send_discord("戰鬥陀螺新品", link, "請進頁面查看", notice_type="新品上架")
         else:
-            if not known_products.get(link, False) and has_stock:
-                send_discord(title, link, price, notice_type="現貨補貨")
+            if not known_products.get(link, False):
+                send_discord("戰鬥陀螺補貨", link, "請進頁面查看", notice_type="現貨補貨")
 
-    print(f"有效商品比對完成，共辨識出 {found_count} 筆。")
+    # 4. 如果正則與 Script 均未抓到，印出除錯標籤
+    if not product_handles and not json_products:
+        print("未抓到任何商品元素，嘗試印出網頁前 500 字元供排查：")
+        print(html_text[:500])
 
 
 def main():
@@ -150,7 +129,7 @@ def main():
 
     known_products.update(current_round)
     save_known_products(known_products)
-    print("全流程執行結束。")
+    print("檢查結束。")
 
 
 if __name__ == "__main__":
