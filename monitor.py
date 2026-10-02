@@ -9,12 +9,8 @@ from bs4 import BeautifulSoup
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 CACHE_FILE = "known_products.json"
 
-# 1. Funbox 官網設定
+# Funbox 官網戰鬥陀螺分類
 FUNBOX_URL = "https://shop.funbox.com.tw/categories/takaratomy/beyblade"
-
-# 2. 蝦皮商城設定 (fun box 玩具旗艦館)
-SHOPEE_SHOP_ID = "285705541"
-SHOPEE_API_URL = f"https://shopee.tw/api/v4/shop/search_items?shopid={SHOPEE_SHOP_ID}&limit=30&offset=0&keyword=戰鬥陀螺"
 
 COMMON_HEADERS = {
     "User-Agent": (
@@ -25,20 +21,12 @@ COMMON_HEADERS = {
     "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
-SHOPEE_HEADERS = {
-    **COMMON_HEADERS,
-    "Referer": f"https://shopee.tw/shop/{SHOPEE_SHOP_ID}/search?keyword=%E6%88%B0%E9%87%98%E9%99%80%E8%9E%BA",
-    "x-requested-with": "XMLHttpRequest",
-    "af-ac-enc-dat": "",
-}
-
 
 def send_discord(title, link, price, source_name="Funbox 官網", notice_type="新品上架"):
     if not DISCORD_WEBHOOK_URL:
         print("未設定 DISCORD_WEBHOOK_URL，跳過推播。")
         return
 
-    # 補貨為綠色，新品為橘金色
     color = 3066993 if notice_type == "現貨補貨" else 15844367
 
     embed = {
@@ -74,8 +62,7 @@ def load_known_products():
             if isinstance(data, list):
                 return {url: False for url in data}
             return data
-    except Exception as e:
-        print(f"讀取快取失敗: {e}")
+    except Exception:
         return {}
 
 
@@ -97,19 +84,32 @@ def check_official(known_products, current_round):
         return
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    cards = soup.select(".box, .product-item, [class*='ProductItem']") or soup.select("a[href*='/products/']")
+    
+    # 擴大搜尋所有連往商品頁的 a 標籤
+    product_links = soup.find_all("a", href=re.compile(r"/(products|SalePage)/"))
+    print(f"官網找到相關商品連結數: {len(product_links)}")
 
-    for card in cards:
-        link_elem = card if card.name == "a" else card.select_one("a[href*='/products/']")
-        if not link_elem or not link_elem.get("href"):
+    found_links = set()
+    for link_elem in product_links:
+        raw_link = link_elem.get("href", "")
+        if not raw_link:
             continue
 
-        raw_link = link_elem["href"]
         link = raw_link if raw_link.startswith("http") else f"https://shop.funbox.com.tw{raw_link}"
         link = link.split("?")[0]
 
-        title = link_elem.get_text(strip=True)
+        if link in found_links:
+            continue
+        found_links.add(link)
+
+        # 向上尋找最接近的容器卡片以取得價格與標題
+        card = link_elem.find_parent("li") or link_elem.find_parent("div") or link_elem
         text = card.get_text(separator=" ", strip=True)
+
+        title = link_elem.get_text(strip=True) or card.get_text(strip=True)[:30]
+        # 過濾純圖片或無文字情況
+        if not title or len(title) < 2:
+            continue
 
         price_match = re.search(r"NT\$\s*[\d,]+", text)
         price = price_match.group(0) if price_match else ""
@@ -117,6 +117,7 @@ def check_official(known_products, current_round):
         is_sold_out = any(k in text for k in ["售完", "補貨中", "缺貨", "售罄", "Sold Out"])
         has_stock = not is_sold_out
 
+        print(f"發現商品: {title} | 現貨: {has_stock} | 連結: {link}")
         current_round[link] = has_stock
 
         if link not in known_products:
@@ -127,55 +128,11 @@ def check_official(known_products, current_round):
                 send_discord(title, link, price, source_name="Funbox 官網", notice_type="現貨補貨")
 
 
-def check_shopee(known_products, current_round):
-    print("正在巡邏 Funbox 蝦皮商城...")
-    try:
-        resp = requests.get(SHOPEE_API_URL, headers=SHOPEE_HEADERS, timeout=15)
-        if resp.status_code != 200:
-            print(f"蝦皮 API 請求未成功，狀態碼: {resp.status_code}")
-            return
-        data = resp.json()
-    except Exception as e:
-        print(f"蝦皮請求失敗: {e}")
-        return
-
-    items = data.get("data", {}).get("items", [])
-    if not items:
-        print("蝦皮未搜尋到相關商品或 API 回傳為空。")
-        return
-
-    for item in items:
-        item_basic = item.get("item_basic", {})
-        item_id = item_basic.get("itemid")
-        shop_id = item_basic.get("shopid")
-        name = item_basic.get("name", "")
-        stock = item_basic.get("stock", 0)
-
-        raw_price = item_basic.get("price", 0)
-        price = f"NT$ {int(raw_price / 100000)}" if raw_price else ""
-
-        if not item_id:
-            continue
-
-        link = f"https://shopee.tw/product/{shop_id}/{item_id}"
-        has_stock = stock > 0
-        current_round[link] = has_stock
-
-        if link not in known_products:
-            if has_stock:
-                send_discord(name, link, price, source_name="Funbox 蝦皮", notice_type="新品上架")
-        else:
-            if not known_products.get(link, False) and has_stock:
-                send_discord(name, link, price, source_name="Funbox 蝦皮", notice_type="現貨補貨")
-
-
 def main():
     known_products = load_known_products()
     current_round = {}
 
     check_official(known_products, current_round)
-    time.sleep(2)
-    check_shopee(known_products, current_round)
 
     known_products.update(current_round)
     save_known_products(known_products)
